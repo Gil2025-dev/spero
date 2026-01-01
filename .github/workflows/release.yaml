@@ -1,93 +1,124 @@
-name: Release (Windows Self-Hosted)
+name: "Release (Hybrid: GitHub-hosted + Optional Self-hosted)"
 
 on:
   workflow_dispatch:
+    inputs:
+      run_self_hosted:
+        description: "Run device/intranet tests on self-hosted runner (requires an online runner with label: self-hosted, windows, x64, release)"
+        type: boolean
+        default: false
   push:
     tags:
       - "v*.*.*"
 
-# 같은 runner 에서 장비 테스트가 겹치지 않도록 (권장)
+# 같은 runner 에서 작업이 겹치지 않도록 (권장)
 concurrency:
-  group: windows-selfhosted-release
+  group: windows-release-hybrid
   cancel-in-progress: false
 
 permissions:
   contents: write
 
-# ✅ self-hosted runner PC에 Python이 이미 설치되어 있다는 가정.
-# ✅ GitHub-hosted 액션의 PowerShell 스크립트 실행(ExecutionPolicy) 이슈를 피하기 위해
-#    run step은 기본적으로 cmd로 실행합니다.
-defaults:
-  run:
-    shell: cmd
-
 env:
   CI: "true"
   PYTHON_MIN: "3.8"
   VENV_DIR: ".venv"
-  PYTHONDONTWRITEBYTECODE: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_PYTHON_VERSION_WARNING: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
   notebook_report:
-    name: Notebook run (best-effort) + HTML report
-    runs-on: [self-hosted, windows, x64, release]
+    name: Notebook run (best-effort) + HTML report [GitHub-hosted]
+    runs-on: windows-latest
     timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify Python (preinstalled on runner, >= PYTHON_MIN)
-        run: |
-          where.exe python
-          python --version
-          python -c "import os,sys; minv=os.environ.get('PYTHON_MIN','3.8'); mv=tuple(map(int,minv.split('.')[:2])); cur=(sys.version_info.major,sys.version_info.minor); print(f'Python OK: {sys.version.split()[0]} (required >= {minv})'); sys.exit(0 if cur>=mv else 1)"
+      # GitHub-hosted에서는 setup-python 사용 가능 (self-hosted의 ExecutionPolicy 이슈 없음)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Create venv and verify venv is used
+      - name: Verify Python (>= PYTHON_MIN)
+        shell: pwsh
         run: |
-          if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%"
-          python -m venv "%VENV_DIR%"
-          "%VENV_DIR%\Scripts\python" -c "import sys; print('venv python:', sys.executable); assert '.venv' in sys.executable.lower(), sys.executable"
+          $ErrorActionPreference = "Stop"
+          python --version
+          $cur = [version](python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          $min = [version]"$env:PYTHON_MIN"
+          if ($cur -lt $min) { throw "Python >= $env:PYTHON_MIN required. Current: $cur" }
+
+      - name: Create venv
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "$env:VENV_DIR") { Remove-Item -Recurse -Force "$env:VENV_DIR" }
+          python -m venv "$env:VENV_DIR"
+          & "$env:VENV_DIR\Scripts\python" -c "import sys; print('venv python:', sys.executable)"
 
       - name: Install dependencies into venv
+        shell: pwsh
         run: |
-          "%VENV_DIR%\Scripts\python" -m pip install --upgrade pip setuptools wheel
-          if exist requirements.txt "%VENV_DIR%\Scripts\python" -m pip install -r requirements.txt
-          "%VENV_DIR%\Scripts\python" -m pip install jupyter nbconvert nbclient papermill ipykernel
-          "%VENV_DIR%\Scripts\python" -m ipykernel install --user --name python --display-name "Python (CI)"
+          $ErrorActionPreference = "Stop"
+          & "$env:VENV_DIR\Scripts\python" -m pip install --upgrade pip setuptools wheel
+          if (Test-Path "requirements.txt") {
+            & "$env:VENV_DIR\Scripts\python" -m pip install -r requirements.txt
+          }
+          & "$env:VENV_DIR\Scripts\python" -m pip install jupyter nbconvert nbclient papermill ipykernel
+          & "$env:VENV_DIR\Scripts\python" -m ipykernel install --user --name python --display-name "Python (CI)"
 
       - name: Run notebooks (best-effort) and export HTML
+        shell: pwsh
         run: |
-          if not exist artifacts\executed_notebooks mkdir artifacts\executed_notebooks
-          if not exist artifacts\reports_html mkdir artifacts\reports_html
+          $ErrorActionPreference = "Stop"
 
-          if exist Project_Spero_ci.ipynb (
-            echo Using preferred notebook: Project_Spero_ci.ipynb
-            "%VENV_DIR%\Scripts\python" -m papermill Project_Spero_ci.ipynb artifacts\executed_notebooks\Project_Spero_ci.executed.ipynb -k python --request-save-on-cell-execute
-            "%VENV_DIR%\Scripts\python" -m jupyter nbconvert artifacts\executed_notebooks\Project_Spero_ci.executed.ipynb --to html --output-dir artifacts\reports_html --no-input
-          ) else (
-            if exist notebooks (
-              echo Running notebooks under notebooks\ (skipping *.no-ci.ipynb)
-              for /r notebooks %%F in (*.ipynb) do (
-                echo %%~nxF | findstr /i "\.no-ci\.ipynb$" >nul
-                if errorlevel 1 (
-                  echo Running: %%F
-                  "%VENV_DIR%\Scripts\python" -m papermill "%%F" "artifacts\executed_notebooks\%%~nF.executed.ipynb" -k python --request-save-on-cell-execute
-                  if errorlevel 1 (
-                    echo Notebook failed (best-effort): %%F
-                  ) else (
-                    "%VENV_DIR%\Scripts\python" -m jupyter nbconvert "artifacts\executed_notebooks\%%~nF.executed.ipynb" --to html --output-dir artifacts\reports_html --no-input
-                  )
-                ) else (
-                  echo Skipped: %%F
-                )
-              )
-            ) else (
-              echo No notebook target found (Project_Spero_ci.ipynb or notebooks\). Skipping.
-            )
-          )
+          $outExecDir = "artifacts\executed_notebooks"
+          $outHtmlDir = "artifacts\reports_html"
+          New-Item -ItemType Directory -Force -Path $outExecDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $outHtmlDir | Out-Null
+
+          $py = "$env:VENV_DIR\Scripts\python"
+
+          # 우선순위:
+          # 1) 루트의 Project_Spero_ci.ipynb (있으면 이것만 실행)
+          # 2) notebooks/ 아래 *.ipynb 전체 실행 (단, *.no-ci.ipynb 는 스킵)
+          $preferred = "Project_Spero_ci.ipynb"
+          $nbs = @()
+
+          if (Test-Path $preferred) {
+            $nbs = @(Get-Item $preferred)
+            Write-Host "Using preferred notebook: $preferred"
+          } elseif (Test-Path "notebooks") {
+            $nbs = Get-ChildItem -Path "notebooks" -Recurse -Filter "*.ipynb" |
+                   Where-Object { $_.FullName -notmatch "\.no-ci\.ipynb$" }
+            Write-Host "Found notebooks under notebooks/: $($nbs.Count)"
+          } else {
+            Write-Host "No notebook target found (Project_Spero_ci.ipynb or notebooks/)."
+            exit 0
+          }
+
+          foreach ($nb in $nbs) {
+            $nameOnly = [IO.Path]::GetFileNameWithoutExtension($nb.Name)
+            $execOut  = Join-Path $outExecDir ($nameOnly + ".executed.ipynb")
+
+            Write-Host "Running notebook: $($nb.FullName)"
+            try {
+              & $py -m papermill "$($nb.FullName)" "$execOut" -k python --request-save-on-cell-execute
+            }
+            catch {
+              Write-Warning "Notebook failed (best-effort): $($nb.FullName)"
+              Write-Warning $_
+              continue
+            }
+
+            Write-Host "Exporting HTML: $execOut"
+            & $py -m jupyter nbconvert "$execOut" --to html --output-dir "$outHtmlDir" --no-input
+          }
 
       - name: Upload notebook artifacts
         uses: actions/upload-artifact@v4
@@ -104,9 +135,9 @@ jobs:
             artifacts/reports_html/*.html
             artifacts/executed_notebooks/*.ipynb
 
-  device_and_intranet_tests:
-    name: Device/Intranet dependent tests (Windows self-hosted)
-    runs-on: [self-hosted, windows, x64, release]
+  unit_tests:
+    name: Unit tests (non-device) [GitHub-hosted]
+    runs-on: windows-latest
     timeout-minutes: 60
     needs: [notebook_report]
 
@@ -114,40 +145,99 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify Python (preinstalled on runner, >= PYTHON_MIN)
-        run: |
-          where.exe python
-          python --version
-          python -c "import os,sys; minv=os.environ.get('PYTHON_MIN','3.8'); mv=tuple(map(int,minv.split('.')[:2])); cur=(sys.version_info.major,sys.version_info.minor); print(f'Python OK: {sys.version.split()[0]} (required >= {minv})'); sys.exit(0 if cur>=mv else 1)"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Create venv and verify venv is used
+      - name: Create venv + install deps
+        shell: pwsh
         run: |
-          if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%"
-          python -m venv "%VENV_DIR%"
-          "%VENV_DIR%\Scripts\python" -c "import sys; print('venv python:', sys.executable); assert '.venv' in sys.executable.lower(), sys.executable"
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "$env:VENV_DIR") { Remove-Item -Recurse -Force "$env:VENV_DIR" }
+          python -m venv "$env:VENV_DIR"
+          & "$env:VENV_DIR\Scripts\python" -m pip install --upgrade pip setuptools wheel
+          if (Test-Path "requirements.txt") {
+            & "$env:VENV_DIR\Scripts\python" -m pip install -r requirements.txt
+          }
+          & "$env:VENV_DIR\Scripts\python" -m pip install pytest
 
-      - name: Install dependencies into venv
+      - name: Run tests (skip device/intranet markers if they exist)
+        shell: pwsh
         run: |
-          "%VENV_DIR%\Scripts\python" -m pip install --upgrade pip setuptools wheel
-          if exist requirements.txt "%VENV_DIR%\Scripts\python" -m pip install -r requirements.txt
-          "%VENV_DIR%\Scripts\python" -m pip install pytest
-
-      - name: Run device/intranet tests
-        env:
-          DEVICE_TEST: "1"
-          INTRANET_TEST: "1"
-        run: |
-          if exist tests (
-            "%VENV_DIR%\Scripts\python" -m pytest -q tests -m "device or intranet" --maxfail=1
-          ) else (
-            echo No tests\ directory. Skipping device/intranet tests.
-          )
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "tests") {
+            # device/intranet 테스트는 self-hosted에서만 수행하도록 제외
+            & "$env:VENV_DIR\Scripts\python" -m pytest -q tests -m "not device and not intranet" --maxfail=1
+          } else {
+            Write-Host "No tests/ directory. Skipping."
+          }
 
       - name: Upload test logs (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: device-test-logs
+          name: unit-test-logs
+          path: |
+            .pytest_cache/
+            **/test-results*.xml
+            **/*.log
+          if-no-files-found: ignore
+
+  device_and_intranet_tests_selfhosted:
+    name: Device/Intranet tests [Self-hosted OPTIONAL]
+    # self-hosted runner가 없으면 "대기 상태로 멈추지 않도록"
+    # workflow_dispatch에서 입력값을 true로 켰을 때만 실행합니다.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_self_hosted }}
+    runs-on: [self-hosted, windows, x64, release]
+    timeout-minutes: 60
+    needs: [unit_tests]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Python on runner (>= PYTHON_MIN)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          where.exe python
+          python --version
+          $cur = [version](python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          $min = [version]"$env:PYTHON_MIN"
+          if ($cur -lt $min) { throw "Python >= $env:PYTHON_MIN required. Current: $cur" }
+
+      - name: Create venv + install deps (self-hosted)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "$env:VENV_DIR") { Remove-Item -Recurse -Force "$env:VENV_DIR" }
+          python -m venv "$env:VENV_DIR"
+          & "$env:VENV_DIR\Scripts\python" -m pip install --upgrade pip setuptools wheel
+          if (Test-Path "requirements.txt") {
+            & "$env:VENV_DIR\Scripts\python" -m pip install -r requirements.txt
+          }
+          & "$env:VENV_DIR\Scripts\python" -m pip install pytest
+
+      - name: Run device/intranet tests (self-hosted)
+        shell: powershell
+        env:
+          DEVICE_TEST: "1"
+          INTRANET_TEST: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "tests") {
+            & "$env:VENV_DIR\Scripts\python" -m pytest -q tests -m "device or intranet" --maxfail=1
+          } else {
+            Write-Host "No tests/ directory. Skipping device/intranet tests."
+          }
+
+      - name: Upload self-hosted test logs (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-intranet-test-logs
           path: |
             .pytest_cache/
             **/test-results*.xml
