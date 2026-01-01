@@ -85,9 +85,9 @@ jobs:
           $py = "$env:VENV_DIR\Scripts\python"
 
           # 우선순위:
-          # 1) 루트의 Project_Spero_ci.ipynb (있으면 이것만 실행)
+          # 1) 루트의 Project_Spero_cProject_Speroi.ipynb (있으면 이것만 실행)
           # 2) notebooks/ 아래 *.ipynb 전체 실행 (단, *.no-ci.ipynb 는 스킵)
-          $preferred = "Project_Spero_ci.ipynb"
+          $preferred = "Project_Spero.ipynb"
           $nbs = @()
 
           if (Test-Path $preferred) {
@@ -98,7 +98,7 @@ jobs:
                    Where-Object { $_.FullName -notmatch "\.no-ci\.ipynb$" }
             Write-Host "Found notebooks under notebooks/: $($nbs.Count)"
           } else {
-            Write-Host "No notebook target found (Project_Spero_ci.ipynb or notebooks/)."
+            Write-Host "No notebook target found (Project_Spero.ipynb or notebooks/)."
             exit 0
           }
 
