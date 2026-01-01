@@ -1,3 +1,4 @@
+# "This workflow is disabled by default and must be enabled manually.
 name: "Release (Hybrid: GitHub-hosted + Optional Self-hosted)"
 
 on:
