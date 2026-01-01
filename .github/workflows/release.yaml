@@ -6,7 +6,7 @@ on:
     tags:
       - "v*.*.*"
 
-# 같은 runner 에서 장비 테스트가 겸치지 않도록 (권장  )
+# 같은 runner 에서 장비 테스트가 겹치지 않도록 (권장)
 concurrency:
   group: windows-selfhosted-release
   cancel-in-progress: false
@@ -16,6 +16,7 @@ permissions:
 
 env:
   CI: "true"
+  PYTHON_MIN: "3.8"
   PYTHONDONTWRITEBYTECODE: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_PYTHON_VERSION_WARNING: "1"
@@ -24,62 +25,73 @@ jobs:
   notebook_report:
     name: Notebook run (best-effort) + HTML report
     runs-on: [self-hosted, windows, x64, release]
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # ✅ self-hosted에서는 runner PC에 Python이 미리 설치되어 있다고 가정하고,
+      #    actions/setup-python을 사용하지 않습니다(ExecutionPolicy 이슈 회피).
+      - name: Verify Python (preinstalled on runner)
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install build twine
+          $ErrorActionPreference = "Stop"
+          where.exe python
+          python --version
+          $cur = [version](python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          $min = [version]"$env:PYTHON_MIN"
+          if ($cur -lt $min) {
+            throw "Python >= $env:PYTHON_MIN is required on the self-hosted runner. Current: $cur"
+          }
 
       - name: Install dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip setuptools wheel
           if (Test-Path "requirements.txt") {
             pip install -r requirements.txt
           }
-          # Notebook 실행/변환 도구(프로젝트 requirements에 이미 있으면 중복 설치되어도 무해)
-          pip install jupyter nbconvert nbclient papermill
-      
+          # Notebook 실행/변환 도구
+          pip install jupyter nbconvert nbclient papermill ipykernel
+          # papermill에서 -k python 을 쓰기 위한 커널 등록
+          python -m ipykernel install --user --name python --display-name "Python (CI)"
+
       - name: Run notebooks (best-effort) and export HTML
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # 노트북 경로 규칙:
-          # - 기본: notebooks/ 아래의 *.ipynb 전부
-          # - 파일명에 ".no-ci.ipynb" 포함되면 CI에서 스킵
-          $nbRoot = "notebooks"
           $outExecDir = "artifacts\executed_notebooks"
           $outHtmlDir = "artifacts\reports_html"
           New-Item -ItemType Directory -Force -Path $outExecDir | Out-Null
           New-Item -ItemType Directory -Force -Path $outHtmlDir | Out-Null
 
-          if (-not (Test-Path $nbRoot)) {
-            Write-Host "No notebooks/ directory. Skipping notebook run."
-            exit 0
-          }
+          # 우선순위:
+          # 1) 루트의 Project_Spero_ci.ipynb (있으면 이것만 실행)
+          # 2) notebooks/ 아래 *.ipynb 전체 실행 (단, *.no-ci.ipynb 는 스킵)
+          $preferred = "Project_Spero_ci.ipynb"
+          $nbs = @()
 
-          $nbs = Get-ChildItem -Path $nbRoot -Recurse -Filter "*.ipynb" |
-                 Where-Object { $_.FullName -notmatch "\.no-ci\.ipynb$" }
-
-          if ($nbs.Count -eq 0) {
-            Write-Host "No notebooks found (or all skipped)."
+          if (Test-Path $preferred) {
+            $nbs = @(Get-Item $preferred)
+            Write-Host "Using preferred notebook: $preferred"
+          } elseif (Test-Path "notebooks") {
+            $nbs = Get-ChildItem -Path "notebooks" -Recurse -Filter "*.ipynb" |
+                   Where-Object { $_.FullName -notmatch "\.no-ci\.ipynb$" }
+            Write-Host "Found notebooks under notebooks/: $($nbs.Count)"
+          } else {
+            Write-Host "No notebook target found (Project_Spero_ci.ipynb or notebooks/)."
             exit 0
           }
 
           foreach ($nb in $nbs) {
-            $rel = Resolve-Path $nb.FullName
             $nameOnly = [IO.Path]::GetFileNameWithoutExtension($nb.Name)
-            $execOut = Join-Path $outExecDir ($nameOnly + ".executed.ipynb")
+            $execOut  = Join-Path $outExecDir ($nameOnly + ".executed.ipynb")
 
             Write-Host "Running notebook: $($nb.FullName)"
-            # best-effort: 실패해도 전체 workflow를 멈추고 싶다면 catch 제거.
             try {
-              # papermill로 실행된 노트북 저장
               papermill "$($nb.FullName)" "$execOut" -k python --request-save-on-cell-execute
             }
             catch {
@@ -98,7 +110,7 @@ jobs:
           name: notebook-reports
           path: artifacts/
           if-no-files-found: warn
-      
+
       # 태그 푸시일 때만 GitHub Release에 리포트 첨부
       - name: Publish GitHub Release (attach reports)
         if: startsWith(github.ref, 'refs/tags/')
@@ -107,3 +119,59 @@ jobs:
           files: |
             artifacts/reports_html/*.html
             artifacts/executed_notebooks/*.ipynb
+
+  device_and_intranet_tests:
+    name: Device/Intranet dependent tests (Windows self-hosted)
+    runs-on: [self-hosted, windows, x64, release]
+    timeout-minutes: 60
+    needs: [notebook_report]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Python (preinstalled on runner)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          where.exe python
+          python --version
+          $cur = [version](python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          $min = [version]"$env:PYTHON_MIN"
+          if ($cur -lt $min) {
+            throw "Python >= $env:PYTHON_MIN is required on the self-hosted runner. Current: $cur"
+          }
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip setuptools wheel
+          if (Test-Path "requirements.txt") {
+            pip install -r requirements.txt
+          }
+          pip install pytest
+
+      - name: Run device/intranet tests
+        shell: pwsh
+        env:
+          DEVICE_TEST: "1"
+          INTRANET_TEST: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "tests") {
+            pytest -q tests -m "device or intranet" --maxfail=1
+          } else {
+            Write-Host "No tests/ directory. Skipping device/intranet tests."
+          }
+
+      - name: Upload test logs (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-test-logs
+          path: |
+            .pytest_cache/
+            **/test-results*.xml
+            **/*.log
+          if-no-files-found: ignore
