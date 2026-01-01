@@ -14,9 +14,17 @@ concurrency:
 permissions:
   contents: write
 
+# ✅ self-hosted runner PC에 Python이 이미 설치되어 있다는 가정.
+# ✅ GitHub-hosted 액션의 PowerShell 스크립트 실행(ExecutionPolicy) 이슈를 피하기 위해
+#    run step은 기본적으로 cmd로 실행합니다.
+defaults:
+  run:
+    shell: cmd
+
 env:
   CI: "true"
   PYTHON_MIN: "3.8"
+  VENV_DIR: ".venv"
   PYTHONDONTWRITEBYTECODE: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_PYTHON_VERSION_WARNING: "1"
@@ -31,78 +39,55 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ✅ self-hosted에서는 runner PC에 Python이 미리 설치되어 있다고 가정하고,
-      #    actions/setup-python을 사용하지 않습니다(ExecutionPolicy 이슈 회피).
-      - name: Verify Python (preinstalled on runner)
-        shell: powershell
+      - name: Verify Python (preinstalled on runner, >= PYTHON_MIN)
         run: |
-          $ErrorActionPreference = "Stop"
           where.exe python
           python --version
-          $cur = [version](python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-          $min = [version]"$env:PYTHON_MIN"
-          if ($cur -lt $min) {
-            throw "Python >= $env:PYTHON_MIN is required on the self-hosted runner. Current: $cur"
-          }
+          python -c "import os,sys; minv=os.environ.get('PYTHON_MIN','3.8'); mv=tuple(map(int,minv.split('.')[:2])); cur=(sys.version_info.major,sys.version_info.minor); print(f'Python OK: {sys.version.split()[0]} (required >= {minv})'); sys.exit(0 if cur>=mv else 1)"
 
-      - name: Install dependencies
-        shell: powershell
+      - name: Create venv and verify venv is used
         run: |
-          $ErrorActionPreference = "Stop"
-          python -m pip install --upgrade pip setuptools wheel
-          if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
-          }
-          # Notebook 실행/변환 도구
-          pip install jupyter nbconvert nbclient papermill ipykernel
-          # papermill에서 -k python 을 쓰기 위한 커널 등록
-          python -m ipykernel install --user --name python --display-name "Python (CI)"
+          if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%"
+          python -m venv "%VENV_DIR%"
+          "%VENV_DIR%\Scripts\python" -c "import sys; print('venv python:', sys.executable); assert '.venv' in sys.executable.lower(), sys.executable"
+
+      - name: Install dependencies into venv
+        run: |
+          "%VENV_DIR%\Scripts\python" -m pip install --upgrade pip setuptools wheel
+          if exist requirements.txt "%VENV_DIR%\Scripts\python" -m pip install -r requirements.txt
+          "%VENV_DIR%\Scripts\python" -m pip install jupyter nbconvert nbclient papermill ipykernel
+          "%VENV_DIR%\Scripts\python" -m ipykernel install --user --name python --display-name "Python (CI)"
 
       - name: Run notebooks (best-effort) and export HTML
-        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          if not exist artifacts\executed_notebooks mkdir artifacts\executed_notebooks
+          if not exist artifacts\reports_html mkdir artifacts\reports_html
 
-          $outExecDir = "artifacts\executed_notebooks"
-          $outHtmlDir = "artifacts\reports_html"
-          New-Item -ItemType Directory -Force -Path $outExecDir | Out-Null
-          New-Item -ItemType Directory -Force -Path $outHtmlDir | Out-Null
-
-          # 우선순위:
-          # 1) 루트의 Project_Spero_ci.ipynb (있으면 이것만 실행)
-          # 2) notebooks/ 아래 *.ipynb 전체 실행 (단, *.no-ci.ipynb 는 스킵)
-          $preferred = "Project_Spero_ci.ipynb"
-          $nbs = @()
-
-          if (Test-Path $preferred) {
-            $nbs = @(Get-Item $preferred)
-            Write-Host "Using preferred notebook: $preferred"
-          } elseif (Test-Path "notebooks") {
-            $nbs = Get-ChildItem -Path "notebooks" -Recurse -Filter "*.ipynb" |
-                   Where-Object { $_.FullName -notmatch "\.no-ci\.ipynb$" }
-            Write-Host "Found notebooks under notebooks/: $($nbs.Count)"
-          } else {
-            Write-Host "No notebook target found (Project_Spero_ci.ipynb or notebooks/)."
-            exit 0
-          }
-
-          foreach ($nb in $nbs) {
-            $nameOnly = [IO.Path]::GetFileNameWithoutExtension($nb.Name)
-            $execOut  = Join-Path $outExecDir ($nameOnly + ".executed.ipynb")
-
-            Write-Host "Running notebook: $($nb.FullName)"
-            try {
-              papermill "$($nb.FullName)" "$execOut" -k python --request-save-on-cell-execute
-            }
-            catch {
-              Write-Warning "Notebook failed (best-effort): $($nb.FullName)"
-              Write-Warning $_
-              continue
-            }
-
-            Write-Host "Exporting HTML: $execOut"
-            jupyter nbconvert "$execOut" --to html --output-dir "$outHtmlDir" --no-input
-          }
+          if exist Project_Spero_ci.ipynb (
+            echo Using preferred notebook: Project_Spero_ci.ipynb
+            "%VENV_DIR%\Scripts\python" -m papermill Project_Spero_ci.ipynb artifacts\executed_notebooks\Project_Spero_ci.executed.ipynb -k python --request-save-on-cell-execute
+            "%VENV_DIR%\Scripts\python" -m jupyter nbconvert artifacts\executed_notebooks\Project_Spero_ci.executed.ipynb --to html --output-dir artifacts\reports_html --no-input
+          ) else (
+            if exist notebooks (
+              echo Running notebooks under notebooks\ (skipping *.no-ci.ipynb)
+              for /r notebooks %%F in (*.ipynb) do (
+                echo %%~nxF | findstr /i "\.no-ci\.ipynb$" >nul
+                if errorlevel 1 (
+                  echo Running: %%F
+                  "%VENV_DIR%\Scripts\python" -m papermill "%%F" "artifacts\executed_notebooks\%%~nF.executed.ipynb" -k python --request-save-on-cell-execute
+                  if errorlevel 1 (
+                    echo Notebook failed (best-effort): %%F
+                  ) else (
+                    "%VENV_DIR%\Scripts\python" -m jupyter nbconvert "artifacts\executed_notebooks\%%~nF.executed.ipynb" --to html --output-dir artifacts\reports_html --no-input
+                  )
+                ) else (
+                  echo Skipped: %%F
+                )
+              )
+            ) else (
+              echo No notebook target found (Project_Spero_ci.ipynb or notebooks\). Skipping.
+            )
+          )
 
       - name: Upload notebook artifacts
         uses: actions/upload-artifact@v4
@@ -111,7 +96,6 @@ jobs:
           path: artifacts/
           if-no-files-found: warn
 
-      # 태그 푸시일 때만 GitHub Release에 리포트 첨부
       - name: Publish GitHub Release (attach reports)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -130,40 +114,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify Python (preinstalled on runner)
-        shell: powershell
+      - name: Verify Python (preinstalled on runner, >= PYTHON_MIN)
         run: |
-          $ErrorActionPreference = "Stop"
           where.exe python
           python --version
-          $cur = [version](python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-          $min = [version]"$env:PYTHON_MIN"
-          if ($cur -lt $min) {
-            throw "Python >= $env:PYTHON_MIN is required on the self-hosted runner. Current: $cur"
-          }
+          python -c "import os,sys; minv=os.environ.get('PYTHON_MIN','3.8'); mv=tuple(map(int,minv.split('.')[:2])); cur=(sys.version_info.major,sys.version_info.minor); print(f'Python OK: {sys.version.split()[0]} (required >= {minv})'); sys.exit(0 if cur>=mv else 1)"
 
-      - name: Install dependencies
-        shell: powershell
+      - name: Create venv and verify venv is used
         run: |
-          $ErrorActionPreference = "Stop"
-          python -m pip install --upgrade pip setuptools wheel
-          if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
-          }
-          pip install pytest
+          if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%"
+          python -m venv "%VENV_DIR%"
+          "%VENV_DIR%\Scripts\python" -c "import sys; print('venv python:', sys.executable); assert '.venv' in sys.executable.lower(), sys.executable"
+
+      - name: Install dependencies into venv
+        run: |
+          "%VENV_DIR%\Scripts\python" -m pip install --upgrade pip setuptools wheel
+          if exist requirements.txt "%VENV_DIR%\Scripts\python" -m pip install -r requirements.txt
+          "%VENV_DIR%\Scripts\python" -m pip install pytest
 
       - name: Run device/intranet tests
-        shell: powershell
         env:
           DEVICE_TEST: "1"
           INTRANET_TEST: "1"
         run: |
-          $ErrorActionPreference = "Stop"
-          if (Test-Path "tests") {
-            pytest -q tests -m "device or intranet" --maxfail=1
-          } else {
-            Write-Host "No tests/ directory. Skipping device/intranet tests."
-          }
+          if exist tests (
+            "%VENV_DIR%\Scripts\python" -m pytest -q tests -m "device or intranet" --maxfail=1
+          ) else (
+            echo No tests\ directory. Skipping device/intranet tests.
+          )
 
       - name: Upload test logs (if any)
         if: always()
